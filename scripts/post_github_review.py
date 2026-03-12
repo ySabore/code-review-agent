@@ -1,14 +1,39 @@
 #!/usr/bin/env python3
 """
 Post code-review-agent JSON output as a GitHub PR review with line comments.
-Use in GitHub Actions: reads review-output.json, posts to the current PR.
-Env: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_WORKSPACE, and pass PR number + head SHA.
-Works for any repo that runs this from a pull_request workflow.
+Falls back to a single PR comment if the review API fails (e.g. comments on unchanged lines).
+Env: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_WORKSPACE, PR_NUMBER, COMMIT_ID.
 """
 import json
 import os
 import sys
 import urllib.request
+import urllib.error
+
+def rel_path(full_path: str, workspace: str) -> str:
+    workspace = workspace.rstrip("/")
+    if workspace and full_path.startswith(workspace):
+        return full_path[len(workspace):].lstrip("/").replace("\\", "/")
+    return full_path
+
+
+def post_issue_comment(owner: str, repo_name: str, pr_number: str, token: str, body: str) -> bool:
+    """Post a single comment on the PR (fallback when review API fails)."""
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/issues/{pr_number}/comments"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+    req = urllib.request.Request(url, data=json.dumps({"body": body}).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status in (200, 201)
+    except Exception as e:
+        print(f"Issue comment failed: {e}", file=sys.stderr)
+        return False
+
 
 def main():
     token = os.environ.get("GITHUB_TOKEN")
@@ -32,49 +57,58 @@ def main():
     if not issues:
         return 0
 
-    # Paths from agent are absolute; make relative to repo root for GitHub API
-    workspace = workspace.rstrip("/")
+    workspace_clean = workspace.rstrip("/")
     comments = []
     for i in issues:
-        path = i.get("file", "")
-        if workspace and path.startswith(workspace):
-            path = path[len(workspace):].lstrip("/").replace("\\", "/")
+        path = rel_path(i.get("file", ""), workspace_clean)
         line = i.get("line", 1)
         rule = i.get("rule", "review")
         msg = i.get("message", "")
-        body = f"**[{rule}]** {msg}"
-        comments.append({"path": path, "line": line, "body": body})
+        comments.append({"path": path, "line": line, "body": f"**[{rule}]** {msg}"})
 
-    # GitHub allows max 100 comments per review
-    chunk_size = 90
     owner, repo_name = repo.split("/", 1)
-    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{pr_number}/reviews"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
     }
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{pr_number}/reviews"
+    chunk_size = 90
 
     for start in range(0, len(comments), chunk_size):
         chunk = comments[start : start + chunk_size]
         body_text = f"Code review agent found {len(issues)} issue(s). Showing {len(chunk)} comment(s) in this batch."
         if start > 0:
             body_text = f"Continued: comments {start + 1}-{start + len(chunk)} of {len(issues)}."
-        payload = {
-            "commit_id": commit_id,
-            "body": body_text,
-            "event": "COMMENT",
-            "comments": chunk,
-        }
+        payload = {"commit_id": commit_id, "body": body_text, "event": "COMMENT", "comments": chunk}
         req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req) as resp:
                 if resp.status not in (200, 201):
                     print(f"Review post returned {resp.status}", file=sys.stderr)
                     return 1
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode() if e.fp else ""
+            print(f"Review API error {e.code}: {err_body}", file=sys.stderr)
+            # Fallback: post one PR comment with all findings (GitHub only allows line comments on diff lines)
+            summary_lines = [f"**Code review agent** found **{len(issues)}** issue(s):", ""]
+            for i in issues[:100]:  # cap for comment size
+                path = rel_path(i.get("file", ""), workspace_clean)
+                summary_lines.append(f"- `{path}`:{i.get('line')} — **{i.get('rule')}** {i.get('message')}")
+            if len(issues) > 100:
+                summary_lines.append(f"- ... and {len(issues) - 100} more (see Actions log).")
+            body = "\n".join(summary_lines)
+            if post_issue_comment(owner, repo_name, pr_number, token, body):
+                print(f"Posted summary as PR comment ({len(issues)} issues); line comments skipped (API restricts to diff lines).")
+                return 0
+            return 1
         except Exception as e:
             print(f"Failed to post review: {e}", file=sys.stderr)
+            body = f"**Code review agent** found **{len(issues)}** issue(s). See Actions log for details.\n\n"
+            body += "\n".join(f"- `{rel_path(i.get('file',''), workspace_clean)}`:{i.get('line')} — {i.get('message')}" for i in issues[:50])
+            if post_issue_comment(owner, repo_name, pr_number, token, body):
+                return 0
             return 1
 
     print(f"Posted {len(comments)} review comment(s) to PR #{pr_number}")
