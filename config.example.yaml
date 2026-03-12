@@ -1,0 +1,24 @@
+# Code Review Agent configuration
+# Copy to config.yaml and adjust
+
+rules:
+  max_line_length: 120
+  disallow_todo_without_ticket: true
+  require_file_header_comment: false
+
+paths:
+  include:
+    - "**/*.py"
+    - "**/*.js"
+    - "**/*.ts"
+    - "**/*.java"
+  exclude:
+    - "**/node_modules/**"
+    - "**/vendor/**"
+    - "**/.git/**"
+    - "**/build/**"
+    - "**/dist/**"
+
+output:
+  format: text  # text | json
+  fail_on_issues: true
