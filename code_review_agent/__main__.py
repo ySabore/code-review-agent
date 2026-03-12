@@ -13,15 +13,17 @@ except ImportError:
 
 
 def load_config(path: Path) -> dict:
-    """Load config from YAML if available."""
+    """Load config from YAML if available (config.yaml, config.example.yaml, or .code-review.yaml in path)."""
     config = {"rules": {}, "paths": {"include": [], "exclude": []}, "output": {"format": "text", "fail_on_issues": True}}
-    config_path = path / "config.yaml"
-    if not config_path.exists():
-        config_path = path / "config.example.yaml"
-    if config_path.exists() and yaml:
-        with open(config_path) as f:
-            data = yaml.safe_load(f) or {}
-            config.update(data)
+    for name in ("config.yaml", "config.example.yaml", ".code-review.yaml"):
+        config_path = path / name
+        if config_path.exists() and yaml:
+            with open(config_path) as f:
+                data = yaml.safe_load(f) or {}
+            if data:
+                config = {**config, **data}
+                if "paths" in data:
+                    config["paths"] = {**config.get("paths", {}), **data["paths"]}
     return config
 
 
@@ -45,18 +47,55 @@ def check_todo_without_ticket(file_path: Path, content: str) -> list:
     return issues
 
 
-def collect_files(base_path: Path, include: list, exclude: list) -> list:
-    """Collect files matching include/exclude patterns (simplified)."""
-    files = []
-    for root, _, names in os.walk(base_path):
-        root_path = Path(root)
-        if any(ex in str(root_path) for ex in ["node_modules", ".git", "vendor", "build", "dist", ".venv"]):
+def _excluded(path: Path, exclude: list) -> bool:
+    """True if path should be excluded (simple pattern match by path segment)."""
+    parts = path.parts
+    name = path.name
+    for pat in exclude:
+        # Normalize **/foo/** and **/foo to a segment or path snippet
+        part = pat.replace("**/", "").replace("/**", "").strip("/")
+        if not part:
             continue
-        for name in names:
-            p = root_path / name
-            if p.suffix in (".py", ".js", ".ts", ".java") or not include:
-                files.append(p)
-    return files[:200]  # cap for demo
+        # Match path segment (e.g. "nas" matches .../nas/... but not nas-file-processor)
+        if "/" in part:
+            if part in str(path):
+                return True
+        else:
+            if part in parts or name == part:
+                return True
+    return False
+
+
+def collect_files(base_path: Path, include: list, exclude: list, scan_only_under: list = None) -> list:
+    """Collect files matching include/exclude patterns (simplified)."""
+    skip_dir_names = ["node_modules", ".git", "vendor", "build", "dist", ".venv", "nas"]
+    allowed_suffixes = (".py", ".js", ".ts", ".java", ".yml", ".yaml", ".gradle")
+    skip_names = (".DS_Store", "gradlew", "gradlew.bat")
+    skip_suffixes = (".jar",)  # binaries
+    roots_to_walk = [base_path]
+    if scan_only_under:
+        roots_to_walk = [base_path / d for d in scan_only_under if (base_path / d).exists()]
+        if not roots_to_walk:
+            roots_to_walk = [base_path]
+    # When limiting to certain dirs, only keep files under those dirs (path must contain /src/ or /gradle/)
+    allowed_prefixes = tuple(str(base_path / d) for d in (scan_only_under or []))
+    files = []
+    for walk_root in roots_to_walk:
+        for root, _, names in os.walk(walk_root):
+            root_path = Path(root)
+            if any(part in skip_dir_names for part in root_path.parts):
+                continue
+            for name in names:
+                p = root_path / name
+                if name in skip_names or p.suffix in skip_suffixes:
+                    continue
+                if _excluded(p, exclude):
+                    continue
+                if allowed_prefixes and not any(str(p).startswith(prefix) for prefix in allowed_prefixes):
+                    continue
+                if p.suffix in allowed_suffixes or not include:
+                    files.append(p)
+    return files[:500]  # cap for large repos
 
 
 def run_review(base_path: Path, config: dict) -> list:
@@ -70,7 +109,10 @@ def run_review(base_path: Path, config: dict) -> list:
     max_len = rules.get("max_line_length", 120)
     check_todo = rules.get("disallow_todo_without_ticket", False)
 
-    for file_path in collect_files(base_path, include, exclude):
+    scan_only_under = paths_cfg.get("scan_only_under")
+    if scan_only_under is None and "nas-file-processor" in str(base_path):
+        scan_only_under = ["src", "gradle"]
+    for file_path in collect_files(base_path, include, exclude, scan_only_under):
         try:
             text = file_path.read_text(errors="ignore")
             issues.extend(check_line_length(file_path, text, max_len))
@@ -94,9 +136,12 @@ def main() -> int:
         return 2
 
     config = load_config(base)
-    if args.config and Path(args.config).exists():
+    if args.config and Path(args.config).exists() and yaml:
         with open(args.config) as f:
-            config = {**config, **(yaml.safe_load(f) or {})} if yaml else config
+            over = yaml.safe_load(f) or {}
+        config = {**config, **over}
+        if "paths" in over:
+            config["paths"] = {**config.get("paths", {}), **over["paths"]}
 
     issues = run_review(base, config)
     out_fmt = args.format or config.get("output", {}).get("format", "text")
