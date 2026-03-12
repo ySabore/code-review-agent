@@ -36,7 +36,23 @@ def main():
         data = json.load(f)
     issues = data.get("issues", [])
     if not issues:
-        print("No issues to report.")
+        # Post a short "no issues" comment so the reviewer always leaves a trace
+        body = "## Code review agent\n\nNo issues found."
+        owner, repo_name = repo.split("/", 1)
+        url = f"https://api.github.com/repos/{owner}/{repo_name}/issues/{pr_number}/comments"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=json.dumps({"body": body}).encode(), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status in (200, 201):
+                    print("Posted PR comment: No issues found.")
+        except Exception as e:
+            print(f"Could not post comment: {e}", file=sys.stderr)
         sys.exit(0)
 
     workspace_clean = workspace.rstrip("/")
