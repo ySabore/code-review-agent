@@ -4,10 +4,11 @@ A lightweight agent that performs automated code review checks on a codebase. Us
 
 ## Features
 
-- **Static checks**: Basic style, complexity, and pattern checks
+- **Static checks**: Broad sanity checks for formatting, unsafe leftovers, and risky patterns
 - **Configurable rules**: Enable/disable rules via config
 - **CI-friendly**: Exit codes and structured output for pipelines
 - **Extensible**: Add custom rules or integrate with linters
+- **Org-wide defaults**: Scans all text-like files by default (not only language-specific extensions)
 
 ## Requirements
 
@@ -55,6 +56,20 @@ python3 -m code_review_agent --config config.yaml
 ## Configuration
 
 Copy `config.example.yaml` to `config.yaml` and adjust rules and paths as needed.
+
+### Built-in checks
+
+- `line_length`: flags lines longer than `rules.max_line_length`
+- `todo_without_ticket`: optional TODO/FIXME check requiring a ticket hint
+- `trailing_whitespace`: flags lines ending in spaces/tabs
+- `tab_indentation`: optional tab-indentation check
+- `file_length`: optional file line-count limit (`rules.max_file_lines`)
+- `merge_conflict_marker`: flags unresolved `<<<<<<<`, `=======`, `>>>>>>>`
+- `missing_newline_eof`: ensures files end with newline
+- `potential_secret`: catches common credential/token patterns
+- `debug_statement`: optional check for debug leftovers (`print`, `console.log`, `pdb.set_trace`, `debugger`)
+
+By default, the agent includes `**/*` and skips common binaries/noisy directories. This makes it practical for mixed-language repositories and multi-team organizations without extension-by-extension tuning.
 
 ## Use in any repo (GitHub Actions + PR review comments)
 
