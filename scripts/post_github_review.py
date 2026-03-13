@@ -10,7 +10,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 def rel_path(full_path: str, workspace: str) -> str:
     workspace = workspace.rstrip("/")
@@ -44,16 +44,15 @@ def _list_pr_files(owner: str, repo_name: str, pr_number: str, token: str) -> Li
     return json.loads(body)
 
 
-def _build_position_map(patch: str) -> Dict[int, int]:
+def _build_added_line_set(patch: str) -> Set[int]:
     """
-    Map NEW-file line number -> GitHub 'position' in the unified diff.
-    Only lines that exist in the patch are mappable.
+    Track NEW-file line numbers that are actually added in the PR diff.
+    Inline comments are only attempted on added lines, which GitHub can
+    reliably resolve by `line` + `side`.
     """
     new_line = None
-    position = 0
-    mapping: Dict[int, int] = {}
+    added_lines: Set[int] = set()
     for raw in patch.splitlines():
-        position += 1
         if raw.startswith("@@"):
             # @@ -oldStart,oldCount +newStart,newCount @@
             try:
@@ -69,25 +68,45 @@ def _build_position_map(patch: str) -> Dict[int, int]:
             continue
 
         if raw.startswith("+") and not raw.startswith("+++"):
-            mapping[new_line] = position
+            added_lines.add(new_line)
             new_line += 1
         elif raw.startswith("-") and not raw.startswith("---"):
             # deletion: does not advance new line
             continue
+        elif raw.startswith("\\"):
+            # "\ No newline at end of file" is patch metadata, not a file line.
+            continue
         else:
             # context line
-            mapping[new_line] = position
             new_line += 1
-    return mapping
+    return added_lines
 
 
-def _post_pr_review(owner: str, repo_name: str, pr_number: str, token: str, commit_id: str, comments: List[dict], body: str) -> Tuple[bool, str]:
-    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{pr_number}/reviews"
+def _list_pr_review_comments(owner: str, repo_name: str, pr_number: str, token: str) -> List[dict]:
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{pr_number}/comments?per_page=100"
+    status, body = _gh_request(url, token, "GET")
+    if status != 200:
+        raise RuntimeError(f"Failed to list PR review comments: HTTP {status} {body}")
+    return json.loads(body)
+
+
+def _post_inline_pr_comment(
+    owner: str,
+    repo_name: str,
+    pr_number: str,
+    token: str,
+    commit_id: str,
+    path: str,
+    line: int,
+    body: str,
+) -> Tuple[bool, str]:
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{pr_number}/comments"
     payload = {
         "commit_id": commit_id,
-        "event": "COMMENT",
         "body": body,
-        "comments": comments,
+        "path": path,
+        "line": line,
+        "side": "RIGHT",
     }
     try:
         status, resp_body = _gh_request(url, token, "POST", payload)
@@ -158,12 +177,24 @@ def main():
     if commit_id:
         try:
             pr_files = _list_pr_files(owner, repo_name, pr_number, token)
-            patch_maps: Dict[str, Dict[int, int]] = {}
+            added_lines_by_path: Dict[str, Set[int]] = {}
             for f in pr_files:
                 path = f.get("filename")
                 patch = f.get("patch")
                 if path and patch:
-                    patch_maps[path] = _build_position_map(patch)
+                    added_lines_by_path[path] = _build_added_line_set(patch)
+
+            existing_comment_keys = set()
+            try:
+                existing_comments = _list_pr_review_comments(owner, repo_name, pr_number, token)
+                for comment in existing_comments:
+                    path = comment.get("path")
+                    line = comment.get("line") or comment.get("original_line")
+                    body = comment.get("body")
+                    if path and isinstance(line, int) and body:
+                        existing_comment_keys.add((path, line, body))
+            except Exception as e:
+                print(f"Could not list existing inline comments: {e}", file=sys.stderr)
 
             inline_comments: List[dict] = []
             for issue in issues:
@@ -171,30 +202,40 @@ def main():
                 line = issue.get("line")
                 if not path or not isinstance(line, int):
                     continue
-                pos = patch_maps.get(path, {}).get(line)
-                if pos is None:
+                if line not in added_lines_by_path.get(path, set()):
                     continue
-                inline_comments.append({
-                    "path": path,
-                    "position": pos,
-                    "body": f"**{issue.get('rule')}**: {issue.get('message')}",
-                })
+                comment_body = f"**{issue.get('rule')}**: {issue.get('message')}"
+                if (path, line, comment_body) in existing_comment_keys:
+                    continue
+                inline_comments.append({"path": path, "line": line, "body": comment_body})
 
             if inline_comments:
-                ok, err = _post_pr_review(
-                    owner=owner,
-                    repo_name=repo_name,
-                    pr_number=pr_number,
-                    token=token,
-                    commit_id=commit_id,
-                    comments=inline_comments,
-                    body=f"Code review agent: inline comments for {len(inline_comments)} finding(s) in the PR diff.",
-                )
-                if ok:
+                posted = 0
+                failed = 0
+                for comment in inline_comments:
+                    ok, err = _post_inline_pr_comment(
+                        owner=owner,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        token=token,
+                        commit_id=commit_id,
+                        path=comment["path"],
+                        line=comment["line"],
+                        body=comment["body"],
+                    )
+                    if ok:
+                        posted += 1
+                    else:
+                        failed += 1
+                        print(
+                            f"Could not post inline comment for {comment['path']}:{comment['line']}: {err}",
+                            file=sys.stderr,
+                        )
+                if posted:
                     inline_posted = True
-                    print(f"Posted PR review with {len(inline_comments)} inline comment(s).")
-                else:
-                    print(f"Could not post inline PR review comments: {err}", file=sys.stderr)
+                    print(f"Posted {posted} inline comment(s).")
+                if failed:
+                    print(f"Failed to post {failed} inline comment(s).", file=sys.stderr)
         except Exception as e:
             print(f"Inline comment attempt failed: {e}", file=sys.stderr)
 
