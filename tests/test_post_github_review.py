@@ -141,4 +141,75 @@ def test_main_deletes_older_summary_comments_after_posting_new_one(tmp_path, mon
         post_github_review.main()
 
     assert exc_info.value.code == 0
-    assert deleted_ids == [100]
+    assert deleted_ids == [100, 300]
+
+
+def test_main_deletes_old_inline_review_comments_before_posting_new_ones(tmp_path, monkeypatch):
+    review_output = tmp_path / "review-output.json"
+    review_output.write_text(
+        json.dumps(
+            {
+                "issues": [
+                    {
+                        "file": str(tmp_path / "src" / "Example.java"),
+                        "line": 1,
+                        "rule": "line_length",
+                        "message": "Line exceeds 120 chars",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("PR_NUMBER", "5")
+    monkeypatch.setenv("COMMIT_ID", "abc123")
+    monkeypatch.setenv("REVIEW_JSON_PATH", str(review_output))
+
+    monkeypatch.setattr(
+        post_github_review,
+        "_list_pr_review_comments",
+        lambda *args, **kwargs: [
+            {"id": 10, "body": "**line_length**: old", "path": "src/Example.java", "line": 1},
+            {"id": 11, "body": "non-generated comment", "path": "src/Example.java", "line": 1},
+        ],
+    )
+    monkeypatch.setattr(
+        post_github_review,
+        "_list_pr_files",
+        lambda *args, **kwargs: [{"filename": "src/Example.java", "patch": "@@ -0,0 +1 @@\n+line\n"}],
+    )
+
+    deleted_ids = []
+    posted_inline = []
+
+    monkeypatch.setattr(
+        post_github_review,
+        "_delete_pr_review_comment",
+        lambda owner, repo_name, comment_id, token: (deleted_ids.append(comment_id) or True, ""),
+    )
+    monkeypatch.setattr(
+        post_github_review,
+        "_post_inline_pr_comment",
+        lambda *args, **kwargs: (posted_inline.append(kwargs["body"]) or True, ""),
+    )
+    monkeypatch.setattr(
+        post_github_review,
+        "_post_issue_comment",
+        lambda *args, **kwargs: (True, json.dumps({"id": 200})),
+    )
+    monkeypatch.setattr(
+        post_github_review,
+        "_list_issue_comments",
+        lambda *args, **kwargs: [{"id": 200, "body": "## Code review agent\n\nLatest"}],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        post_github_review.main()
+
+    assert exc_info.value.code == 0
+    assert deleted_ids == [10]
+    assert posted_inline == ["**line_length**: Line exceeds 120 chars"]

@@ -112,8 +112,60 @@ def _delete_issue_comment(owner: str, repo_name: str, comment_id: int, token: st
         return False, str(e)
 
 
+def _delete_pr_review_comment(owner: str, repo_name: str, comment_id: int, token: str) -> Tuple[bool, str]:
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/comments/{comment_id}"
+    try:
+        status, resp_body = _gh_request(url, token, "DELETE")
+        if status == 204:
+            return True, resp_body
+        return False, f"HTTP {status} {resp_body}"
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if e.fp else ""
+        return False, f"HTTP {e.code} {err_body}"
+    except Exception as e:
+        return False, str(e)
+
+
 def _is_summary_comment(body: str) -> bool:
     return body.startswith("## Code review agent")
+
+
+def _is_generated_finding_comment(body: str) -> bool:
+    return body.startswith("**") and "**:" in body
+
+
+def _cleanup_old_inline_comments(
+    owner: str,
+    repo_name: str,
+    pr_number: str,
+    token: str,
+) -> None:
+    try:
+        review_comments = _list_pr_review_comments(owner, repo_name, pr_number, token)
+        deleted = 0
+        failed = 0
+        for comment in review_comments:
+            comment_id = comment.get("id")
+            body = comment.get("body") or ""
+            if not isinstance(comment_id, int) or not _is_generated_finding_comment(body):
+                continue
+
+            ok, err = _delete_pr_review_comment(owner, repo_name, comment_id, token)
+            if ok:
+                deleted += 1
+            else:
+                failed += 1
+                print(
+                    f"Could not delete old inline comment {comment_id}: {err}",
+                    file=sys.stderr,
+                )
+
+        if deleted:
+            print(f"Deleted {deleted} old inline comment(s).")
+        if failed:
+            print(f"Failed to delete {failed} old inline comment(s).", file=sys.stderr)
+    except Exception as e:
+        print(f"Could not clean up old inline comments: {e}", file=sys.stderr)
 
 
 def _cleanup_old_summary_comments(
@@ -133,9 +185,11 @@ def _cleanup_old_summary_comments(
         for comment in issue_comments:
             comment_id = comment.get("id")
             body = comment.get("body") or ""
-            if comment_id == keep_comment_id or not isinstance(comment_id, int):
+            if not isinstance(comment_id, int):
                 continue
-            if not _is_summary_comment(body):
+            if comment_id == keep_comment_id:
+                continue
+            if not (_is_summary_comment(body) or _is_generated_finding_comment(body)):
                 continue
 
             ok, err = _delete_issue_comment(owner, repo_name, comment_id, token)
@@ -144,16 +198,16 @@ def _cleanup_old_summary_comments(
             else:
                 failed += 1
                 print(
-                    f"Could not delete old summary comment {comment_id}: {err}",
+                    f"Could not delete old generated issue comment {comment_id}: {err}",
                     file=sys.stderr,
                 )
 
         if deleted:
-            print(f"Deleted {deleted} old summary comment(s).")
+            print(f"Deleted {deleted} old generated issue comment(s).")
         if failed:
-            print(f"Failed to delete {failed} old summary comment(s).", file=sys.stderr)
+            print(f"Failed to delete {failed} old generated issue comment(s).", file=sys.stderr)
     except Exception as e:
-        print(f"Could not clean up old summary comments: {e}", file=sys.stderr)
+        print(f"Could not clean up old generated issue comments: {e}", file=sys.stderr)
 
 
 def _post_inline_pr_comment(
@@ -253,6 +307,7 @@ def main():
     inline_posted = False
     if commit_id:
         try:
+            _cleanup_old_inline_comments(owner, repo_name, pr_number, token)
             pr_files = _list_pr_files(owner, repo_name, pr_number, token)
             added_lines_by_path: Dict[str, Set[int]] = {}
             for f in pr_files:
@@ -260,18 +315,6 @@ def main():
                 patch = f.get("patch")
                 if path and patch:
                     added_lines_by_path[path] = _build_added_line_set(patch)
-
-            existing_comment_keys = set()
-            try:
-                existing_comments = _list_pr_review_comments(owner, repo_name, pr_number, token)
-                for comment in existing_comments:
-                    path = comment.get("path")
-                    line = comment.get("line") or comment.get("original_line")
-                    existing_body = comment.get("body")
-                    if path and isinstance(line, int) and existing_body:
-                        existing_comment_keys.add((path, line, existing_body))
-            except Exception as e:
-                print(f"Could not list existing inline comments: {e}", file=sys.stderr)
 
             inline_comments: List[dict] = []
             for issue in issues:
@@ -282,8 +325,6 @@ def main():
                 if line not in added_lines_by_path.get(path, set()):
                     continue
                 comment_body = f"**{issue.get('rule')}**: {issue.get('message')}"
-                if (path, line, comment_body) in existing_comment_keys:
-                    continue
                 inline_comments.append({"path": path, "line": line, "body": comment_body})
 
             if inline_comments:
