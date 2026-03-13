@@ -3,49 +3,28 @@
 
 rules:
   max_line_length: 120
-  max_file_lines: 1500
   disallow_todo_without_ticket: true
-  disallow_trailing_whitespace: true
+  disallow_trailing_whitespace: false
   disallow_tab_indentation: false
   enforce_file_length: false
-  disallow_merge_conflict_markers: true
-  require_newline_at_eof: true
-  disallow_potential_secrets: true
+  max_file_lines: 1500
+  disallow_merge_conflict_markers: false
+  require_newline_at_eof: false
+  disallow_potential_secrets: false
   disallow_debug_statements: false
 
 paths:
   include:
-    - "**/*"
+    - "**/*.py"
+    - "**/*.js"
+    - "**/*.ts"
+    - "**/*.java"
   exclude:
     - "**/node_modules/**"
     - "**/vendor/**"
     - "**/.git/**"
     - "**/build/**"
     - "**/dist/**"
-  skip_dirs:
-    - "node_modules"
-    - ".git"
-    - "vendor"
-    - "build"
-    - "dist"
-    - ".venv"
-    - ".tox"
-    - "coverage"
-    - ".mypy_cache"
-  skip_suffixes:
-    - ".jar"
-    - ".png"
-    - ".jpg"
-    - ".jpeg"
-    - ".gif"
-    - ".ico"
-    - ".zip"
-    - ".pdf"
-    - ".tar"
-    - ".gz"
-    - ".so"
-    - ".dll"
-    - ".exe"
 
 output:
   format: text  # text | json

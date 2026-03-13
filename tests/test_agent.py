@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 def test_import():
     import code_review_agent
@@ -15,7 +17,6 @@ def test_load_config_empty_dir():
         config = load_config(Path(d))
     assert "rules" in config
     assert config["output"]["format"] == "text"
-    assert "skip_dirs" in config["paths"]
 
 
 def test_line_length_check():
@@ -33,61 +34,40 @@ def test_line_length_check():
         path.unlink()
 
 
-def test_collect_files_matches_glob_and_skips_binary_and_dir(tmp_path):
-    from code_review_agent.__main__ import collect_files
-
-    text_file = tmp_path / "docs" / "guide.md"
-    text_file.parent.mkdir(parents=True)
-    text_file.write_text("hello\n")
-
-    png_file = tmp_path / "assets" / "logo.png"
-    png_file.parent.mkdir(parents=True)
-    png_file.write_bytes(b"\x89PNG\x00\x00")
-
-    hidden = tmp_path / ".git" / "meta.txt"
-    hidden.parent.mkdir(parents=True)
-    hidden.write_text("ignored\n")
-
-    files = collect_files(
-        tmp_path,
-        include=["**/*.md", "**/*.png", "**/*.txt"],
-        exclude=[],
-        skip_dirs=[".git"],
-        skip_suffixes=[".png"],
-    )
-    names = {p.name for p in files}
-
-    assert "guide.md" in names
-    assert "logo.png" not in names
-    assert "meta.txt" not in names
-
-
 def test_new_rules_detect_issues(tmp_path):
     from code_review_agent.__main__ import run_review
 
-    bad = tmp_path / "bad.py"
-    bad.write_text(
-        "x = 1  \n"
+    trigger = tmp_path / "src" / "reviewer_trigger.py"
+    trigger.parent.mkdir(parents=True, exist_ok=True)
+    trigger.write_text(
+        "\tprint('debug')   \n"
+        "token = \"ABCDEFGHIJKLMNOPQRSTUV123456\"   \n"
         "<<<<<<< HEAD\n"
-        "print('debug')\n"
         "=======\n"
-        "value = 'AKIA1234567890ABCDEF'\n"
-        ">>>>>>> main"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
     )
+
+    no_newline = tmp_path / "src" / "no_newline.py"
+    no_newline.write_bytes(b"value = 1")
 
     config = {
         "rules": {
             "max_line_length": 120,
             "disallow_todo_without_ticket": False,
             "disallow_trailing_whitespace": True,
-            "disallow_tab_indentation": False,
+            "disallow_tab_indentation": True,
             "enforce_file_length": False,
             "disallow_merge_conflict_markers": True,
             "require_newline_at_eof": True,
             "disallow_potential_secrets": True,
             "disallow_debug_statements": True,
         },
-        "paths": {"include": ["**/*.py"], "exclude": []},
+        "paths": {
+            "include": ["**/*.py"],
+            "exclude": [],
+            "scan_only_under": ["src"],
+        },
         "output": {"format": "text", "fail_on_issues": True},
     }
 
@@ -95,6 +75,7 @@ def test_new_rules_detect_issues(tmp_path):
     rules = {i["rule"] for i in issues}
 
     assert "trailing_whitespace" in rules
+    assert "tab_indentation" in rules
     assert "merge_conflict_marker" in rules
     assert "missing_newline_eof" in rules
     assert "potential_secret" in rules

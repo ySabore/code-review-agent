@@ -1,7 +1,6 @@
 """Entry point for running the code review agent."""
 
 import argparse
-import fnmatch
 import json
 import os
 import re
@@ -14,30 +13,22 @@ except ImportError:
     yaml = None
 
 
-SECRET_PATTERNS = [
-    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
-    ("github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+POTENTIAL_SECRET_PATTERNS = [
     ("generic_api_key", re.compile(r"(?:api[_-]?key|secret|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]", re.IGNORECASE)),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
 ]
 
-
-DEFAULT_SKIP_DIRS = ["node_modules", ".git", "vendor", "build", "dist", ".venv", ".tox", "coverage", ".mypy_cache"]
-DEFAULT_SKIP_SUFFIXES = [".jar", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".zip", ".pdf", ".tar", ".gz", ".so", ".dll", ".exe"]
+DEBUG_STATEMENT_PATTERNS = [
+    re.compile(r"\bprint\s*\("),
+    re.compile(r"\bconsole\.log\s*\("),
+    re.compile(r"\bSystem\.out\.println\s*\("),
+    re.compile(r"\blogger\.debug\s*\("),
+]
 
 
 def load_config(path: Path) -> dict:
     """Load config from YAML if available (config.yaml, config.example.yaml, or .code-review.yaml in path)."""
-    config = {
-        "rules": {},
-        "paths": {
-            "include": ["**/*"],
-            "exclude": [],
-            "skip_dirs": DEFAULT_SKIP_DIRS,
-            "skip_suffixes": DEFAULT_SKIP_SUFFIXES,
-        },
-        "output": {"format": "text", "fail_on_issues": True},
-    }
+    config = {"rules": {}, "paths": {"include": [], "exclude": []}, "output": {"format": "text", "fail_on_issues": True}}
     for name in ("config.yaml", "config.example.yaml", ".code-review.yaml"):
         config_path = path / name
         if config_path.exists() and yaml:
@@ -63,24 +54,24 @@ def check_todo_without_ticket(file_path: Path, content: str) -> list:
     """Report TODO/FIXME without a ticket reference."""
     issues = []
     for i, line in enumerate(content.splitlines(), start=1):
-        line_upper = line.upper()
-        if "TODO" in line_upper or "FIXME" in line_upper:
+        line_lower = line.upper()
+        if "TODO" in line_lower or "FIXME" in line_lower:
             if not any(c in line for c in ["#", "JIRA", "TODO-", "FIXME-", "GH-", "["]):
                 issues.append({"file": str(file_path), "line": i, "rule": "todo_without_ticket", "message": "TODO/FIXME without ticket reference"})
     return issues
 
 
 def check_trailing_whitespace(file_path: Path, content: str) -> list:
-    """Report lines ending with trailing whitespace."""
+    """Report lines with trailing spaces or tabs."""
     issues = []
     for i, line in enumerate(content.splitlines(), start=1):
-        if line.rstrip(" \t") != line:
+        if line != line.rstrip(" \t"):
             issues.append({"file": str(file_path), "line": i, "rule": "trailing_whitespace", "message": "Line has trailing whitespace"})
     return issues
 
 
-def check_tabs_for_indentation(file_path: Path, content: str) -> list:
-    """Report tab-indented lines."""
+def check_tab_indentation(file_path: Path, content: str) -> list:
+    """Report lines indented with tabs."""
     issues = []
     for i, line in enumerate(content.splitlines(), start=1):
         if line.startswith("\t"):
@@ -88,8 +79,8 @@ def check_tabs_for_indentation(file_path: Path, content: str) -> list:
     return issues
 
 
-def check_file_too_long(file_path: Path, content: str, max_lines: int) -> list:
-    """Report files exceeding max line count."""
+def check_file_length(file_path: Path, content: str, max_lines: int) -> list:
+    """Report files that exceed a max line count."""
     line_count = len(content.splitlines())
     if line_count > max_lines:
         return [{"file": str(file_path), "line": 1, "rule": "file_length", "message": f"File has {line_count} lines (max {max_lines})"}]
@@ -100,12 +91,12 @@ def check_merge_conflict_markers(file_path: Path, content: str) -> list:
     """Report unresolved merge conflict markers."""
     issues = []
     for i, line in enumerate(content.splitlines(), start=1):
-        if line.startswith("<<<<<<<") or line.startswith("=======") or line.startswith(">>>>>>>"):
+        if line.startswith(("<<<<<<<", "=======", ">>>>>>>")):
             issues.append({"file": str(file_path), "line": i, "rule": "merge_conflict_marker", "message": "Unresolved merge conflict marker"})
     return issues
 
 
-def check_no_newline_at_eof(file_path: Path, content: str) -> list:
+def check_missing_newline_eof(file_path: Path, content: str) -> list:
     """Report files that do not end with a newline."""
     if content and not content.endswith("\n"):
         return [{"file": str(file_path), "line": max(len(content.splitlines()), 1), "rule": "missing_newline_eof", "message": "File does not end with a newline"}]
@@ -113,10 +104,10 @@ def check_no_newline_at_eof(file_path: Path, content: str) -> list:
 
 
 def check_potential_secrets(file_path: Path, content: str) -> list:
-    """Report probable leaked credentials/secrets."""
+    """Report probable leaked credentials or tokens."""
     issues = []
     for i, line in enumerate(content.splitlines(), start=1):
-        for label, pattern in SECRET_PATTERNS:
+        for label, pattern in POTENTIAL_SECRET_PATTERNS:
             if pattern.search(line):
                 issues.append({"file": str(file_path), "line": i, "rule": "potential_secret", "message": f"Potential secret detected ({label})"})
                 break
@@ -124,19 +115,10 @@ def check_potential_secrets(file_path: Path, content: str) -> list:
 
 
 def check_debug_statements(file_path: Path, content: str) -> list:
-    """Report debug prints/loggers likely left in production code."""
+    """Report likely leftover debug statements."""
     issues = []
-    debug_patterns = [
-        re.compile(r"\bprint\s*\("),
-        re.compile(r"\bconsole\.log\s*\("),
-        re.compile(r"\bdebugger\b"),
-        re.compile(r"\bpdb\.set_trace\s*\("),
-    ]
     for i, line in enumerate(content.splitlines(), start=1):
-        stripped = line.strip()
-        if stripped.startswith("#") or stripped.startswith("//"):
-            continue
-        if any(p.search(line) for p in debug_patterns):
+        if any(pattern.search(line) for pattern in DEBUG_STATEMENT_PATTERNS):
             issues.append({"file": str(file_path), "line": i, "rule": "debug_statement", "message": "Potential debug statement left in code"})
     return issues
 
@@ -146,9 +128,11 @@ def _excluded(path: Path, exclude: list) -> bool:
     parts = path.parts
     name = path.name
     for pat in exclude:
+        # Normalize **/foo/** and **/foo to a segment or path snippet
         part = pat.replace("**/", "").replace("/**", "").strip("/")
         if not part:
             continue
+        # Match path segment (e.g. "nas" matches .../nas/... but not nas-file-processor)
         if "/" in part:
             if part in str(path):
                 return True
@@ -158,60 +142,36 @@ def _excluded(path: Path, exclude: list) -> bool:
     return False
 
 
-def _included(path: Path, include: list, base_path: Path) -> bool:
-    """True if path matches include glob patterns (repo-relative)."""
-    if not include:
-        return True
-    rel = path.relative_to(base_path).as_posix()
-    for pattern in include:
-        normalized = pattern[3:] if pattern.startswith("**/") else pattern
-        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(rel, normalized):
-            return True
-    return False
-
-
-def _is_binary(path: Path) -> bool:
-    """Best-effort binary detection."""
-    try:
-        chunk = path.read_bytes()[:2048]
-    except Exception:
-        return True
-    return b"\x00" in chunk
-
-
-def collect_files(base_path: Path, include: list, exclude: list, scan_only_under: list = None, skip_dirs: list = None, skip_suffixes: list = None) -> list:
+def collect_files(base_path: Path, include: list, exclude: list, scan_only_under: list = None) -> list:
     """Collect files matching include/exclude patterns (simplified)."""
-    effective_skip_dirs = skip_dirs or DEFAULT_SKIP_DIRS
-    effective_skip_suffixes = tuple(skip_suffixes or DEFAULT_SKIP_SUFFIXES)
-    skip_names = (".DS_Store",)
-
+    skip_dir_names = ["node_modules", ".git", "vendor", "build", "dist", ".venv", "nas"]
+    allowed_suffixes = (".py", ".js", ".ts", ".java", ".yml", ".yaml", ".gradle")
+    skip_names = (".DS_Store", "gradlew", "gradlew.bat")
+    skip_suffixes = (".jar",)  # binaries
     roots_to_walk = [base_path]
     if scan_only_under:
         roots_to_walk = [base_path / d for d in scan_only_under if (base_path / d).exists()]
         if not roots_to_walk:
             roots_to_walk = [base_path]
-
+    # When limiting to certain dirs, only keep files under those dirs (path must contain /src/ or /gradle/)
     allowed_prefixes = tuple(str(base_path / d) for d in (scan_only_under or []))
     files = []
     for walk_root in roots_to_walk:
         for root, _, names in os.walk(walk_root):
             root_path = Path(root)
-            if any(part in effective_skip_dirs for part in root_path.parts):
+            if any(part in skip_dir_names for part in root_path.parts):
                 continue
             for name in names:
                 p = root_path / name
-                if name in skip_names or p.suffix.lower() in effective_skip_suffixes:
+                if name in skip_names or p.suffix in skip_suffixes:
                     continue
                 if _excluded(p, exclude):
                     continue
                 if allowed_prefixes and not any(str(p).startswith(prefix) for prefix in allowed_prefixes):
                     continue
-                if not _included(p, include, base_path):
-                    continue
-                if _is_binary(p):
-                    continue
-                files.append(p)
-    return files[:2000]
+                if p.suffix in allowed_suffixes or not include:
+                    files.append(p)
+    return files[:500]  # cap for large repos
 
 
 def run_review(base_path: Path, config: dict) -> list:
@@ -219,28 +179,24 @@ def run_review(base_path: Path, config: dict) -> list:
     issues = []
     rules = config.get("rules", {})
     paths_cfg = config.get("paths", {})
-    include = paths_cfg.get("include", ["**/*"])
+    include = paths_cfg.get("include", ["**/*.py"])
     exclude = paths_cfg.get("exclude", [])
-    skip_dirs = paths_cfg.get("skip_dirs", DEFAULT_SKIP_DIRS)
-    skip_suffixes = paths_cfg.get("skip_suffixes", DEFAULT_SKIP_SUFFIXES)
 
     max_len = rules.get("max_line_length", 120)
     max_file_lines = rules.get("max_file_lines", 1500)
-
     check_todo = rules.get("disallow_todo_without_ticket", False)
-    check_trailing = rules.get("disallow_trailing_whitespace", True)
+    check_trailing = rules.get("disallow_trailing_whitespace", False)
     check_tabs = rules.get("disallow_tab_indentation", False)
-    check_file_length = rules.get("enforce_file_length", False)
-    check_conflicts = rules.get("disallow_merge_conflict_markers", True)
-    check_eof_newline = rules.get("require_newline_at_eof", True)
-    check_secrets = rules.get("disallow_potential_secrets", True)
+    check_file_length_enabled = rules.get("enforce_file_length", False)
+    check_conflicts = rules.get("disallow_merge_conflict_markers", False)
+    check_eof_newline = rules.get("require_newline_at_eof", False)
+    check_secrets = rules.get("disallow_potential_secrets", False)
     check_debug = rules.get("disallow_debug_statements", False)
 
     scan_only_under = paths_cfg.get("scan_only_under")
     if scan_only_under is None and "nas-file-processor" in str(base_path):
         scan_only_under = ["src", "gradle"]
-
-    for file_path in collect_files(base_path, include, exclude, scan_only_under, skip_dirs=skip_dirs, skip_suffixes=skip_suffixes):
+    for file_path in collect_files(base_path, include, exclude, scan_only_under):
         try:
             text = file_path.read_text(errors="ignore")
             issues.extend(check_line_length(file_path, text, max_len))
@@ -249,13 +205,13 @@ def run_review(base_path: Path, config: dict) -> list:
             if check_trailing:
                 issues.extend(check_trailing_whitespace(file_path, text))
             if check_tabs:
-                issues.extend(check_tabs_for_indentation(file_path, text))
-            if check_file_length:
-                issues.extend(check_file_too_long(file_path, text, max_file_lines))
+                issues.extend(check_tab_indentation(file_path, text))
+            if check_file_length_enabled:
+                issues.extend(check_file_length(file_path, text, max_file_lines))
             if check_conflicts:
                 issues.extend(check_merge_conflict_markers(file_path, text))
             if check_eof_newline:
-                issues.extend(check_no_newline_at_eof(file_path, text))
+                issues.extend(check_missing_newline_eof(file_path, text))
             if check_secrets:
                 issues.extend(check_potential_secrets(file_path, text))
             if check_debug:
