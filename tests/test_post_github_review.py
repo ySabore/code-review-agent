@@ -80,3 +80,65 @@ def test_main_keeps_summary_body_when_existing_inline_comments_present(tmp_path,
     assert exc_info.value.code == 0
     assert "## Code review agent found **1** issue(s)" in captured["body"]
     assert "**line_length** Line exceeds 120 chars" in captured["body"]
+
+
+def test_main_deletes_older_summary_comments_after_posting_new_one(tmp_path, monkeypatch):
+    review_output = tmp_path / "review-output.json"
+    review_output.write_text(
+        json.dumps(
+            {
+                "issues": [
+                    {
+                        "file": str(tmp_path / "src" / "Example.java"),
+                        "line": 1,
+                        "rule": "line_length",
+                        "message": "Line exceeds 120 chars",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("PR_NUMBER", "5")
+    monkeypatch.setenv("COMMIT_ID", "")
+    monkeypatch.setenv("REVIEW_JSON_PATH", str(review_output))
+
+    monkeypatch.setattr(
+        post_github_review,
+        "_post_issue_comment",
+        lambda *args, **kwargs: (
+            True,
+            json.dumps({"id": 200, "body": kwargs["body"] if "body" in kwargs else args[-1]}),
+        ),
+    )
+    monkeypatch.setattr(
+        post_github_review,
+        "_list_issue_comments",
+        lambda *args, **kwargs: [
+            {"id": 100, "body": "## Code review agent\n\nOld summary"},
+            {"id": 200, "body": "## Code review agent\n\nNew summary"},
+            {"id": 300, "body": "**debug_statement**: Potential debug statement left in code"},
+        ],
+    )
+
+    deleted_ids = []
+
+    def fake_delete_issue_comment(owner, repo_name, comment_id, token):
+        deleted_ids.append(comment_id)
+        return True, ""
+
+    monkeypatch.setattr(
+        post_github_review,
+        "_delete_issue_comment",
+        fake_delete_issue_comment,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        post_github_review.main()
+
+    assert exc_info.value.code == 0
+    assert deleted_ids == [100]

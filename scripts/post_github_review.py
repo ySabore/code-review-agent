@@ -90,6 +90,72 @@ def _list_pr_review_comments(owner: str, repo_name: str, pr_number: str, token: 
     return json.loads(body)
 
 
+def _list_issue_comments(owner: str, repo_name: str, pr_number: str, token: str) -> List[dict]:
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/issues/{pr_number}/comments?per_page=100"
+    status, body = _gh_request(url, token, "GET")
+    if status != 200:
+        raise RuntimeError(f"Failed to list issue comments: HTTP {status} {body}")
+    return json.loads(body)
+
+
+def _delete_issue_comment(owner: str, repo_name: str, comment_id: int, token: str) -> Tuple[bool, str]:
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/issues/comments/{comment_id}"
+    try:
+        status, resp_body = _gh_request(url, token, "DELETE")
+        if status == 204:
+            return True, resp_body
+        return False, f"HTTP {status} {resp_body}"
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if e.fp else ""
+        return False, f"HTTP {e.code} {err_body}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _is_summary_comment(body: str) -> bool:
+    return body.startswith("## Code review agent")
+
+
+def _cleanup_old_summary_comments(
+    owner: str,
+    repo_name: str,
+    pr_number: str,
+    token: str,
+    keep_comment_id: Optional[int],
+) -> None:
+    if keep_comment_id is None:
+        return
+
+    try:
+        issue_comments = _list_issue_comments(owner, repo_name, pr_number, token)
+        deleted = 0
+        failed = 0
+        for comment in issue_comments:
+            comment_id = comment.get("id")
+            body = comment.get("body") or ""
+            if comment_id == keep_comment_id or not isinstance(comment_id, int):
+                continue
+            if not _is_summary_comment(body):
+                continue
+
+            ok, err = _delete_issue_comment(owner, repo_name, comment_id, token)
+            if ok:
+                deleted += 1
+            else:
+                failed += 1
+                print(
+                    f"Could not delete old summary comment {comment_id}: {err}",
+                    file=sys.stderr,
+                )
+
+        if deleted:
+            print(f"Deleted {deleted} old summary comment(s).")
+        if failed:
+            print(f"Failed to delete {failed} old summary comment(s).", file=sys.stderr)
+    except Exception as e:
+        print(f"Could not clean up old summary comments: {e}", file=sys.stderr)
+
+
 def _post_inline_pr_comment(
     owner: str,
     repo_name: str,
@@ -160,6 +226,17 @@ def main():
         ok, err = _post_issue_comment(owner, repo_name, pr_number, token, "## Code review agent\n\nNo issues found.")
         if ok:
             print("Posted PR comment: No issues found.")
+            try:
+                keep_comment_id = json.loads(err).get("id")
+            except Exception:
+                keep_comment_id = None
+            _cleanup_old_summary_comments(
+                owner,
+                repo_name,
+                pr_number,
+                token,
+                keep_comment_id,
+            )
         else:
             print(f"Could not post comment: {err}", file=sys.stderr)
         sys.exit(0)
@@ -243,6 +320,17 @@ def main():
     ok, err = _post_issue_comment(owner, repo_name, pr_number, token, body)
     if ok:
         print(f"Posted PR comment with {len(issues)} issue(s) to PR #{pr_number}")
+        try:
+            keep_comment_id = json.loads(err).get("id")
+        except Exception:
+            keep_comment_id = None
+        _cleanup_old_summary_comments(
+            owner,
+            repo_name,
+            pr_number,
+            token,
+            keep_comment_id,
+        )
     else:
         print(f"API error posting PR comment: {err}", file=sys.stderr)
 
