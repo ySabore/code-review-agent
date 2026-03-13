@@ -179,8 +179,6 @@ def main():
                     "position": pos,
                     "body": f"**{issue.get('rule')}**: {issue.get('message')}",
                 })
-                if len(inline_comments) >= 20:
-                    break
 
             if inline_comments:
                 ok, err = _post_pr_review(
