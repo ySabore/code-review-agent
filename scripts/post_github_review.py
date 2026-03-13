@@ -190,9 +190,9 @@ def main():
                 for comment in existing_comments:
                     path = comment.get("path")
                     line = comment.get("line") or comment.get("original_line")
-                    body = comment.get("body")
-                    if path and isinstance(line, int) and body:
-                        existing_comment_keys.add((path, line, body))
+                    existing_body = comment.get("body")
+                    if path and isinstance(line, int) and existing_body:
+                        existing_comment_keys.add((path, line, existing_body))
             except Exception as e:
                 print(f"Could not list existing inline comments: {e}", file=sys.stderr)
 
